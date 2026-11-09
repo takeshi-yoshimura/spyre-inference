@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     # module attributes. Keep in sync with ``environment_variables``.
     SPYRE_DEVICES: str | None = None
     SPYRE_MODEL_RUNNER: str = "v1"
+    SPYRE_NATIVE_CACHE_DIR: str | None = None
     SPYRE_COMPILE_GRANULARITY: str = "block"
     SPYRE_COMPILE_GUARD: str = "warn"
     SPYRE_ATTN_PROFILING: bool = False
@@ -58,6 +59,7 @@ _cache: dict[str, Any] = {}
 
 # --8<-- [start:env-vars-definition]
 environment_variables: dict[str, Callable[[], Any]] = {
+    "SPYRE_NATIVE_CACHE_DIR": lambda: os.getenv("SPYRE_NATIVE_CACHE_DIR"),
     # Comma-separated Spyre device indices to run on, mapping each tensor-parallel
     # local rank to a physical card. Unset lets the runtime pick the default device(s).
     "SPYRE_DEVICES": lambda: os.getenv("SPYRE_DEVICES"),
