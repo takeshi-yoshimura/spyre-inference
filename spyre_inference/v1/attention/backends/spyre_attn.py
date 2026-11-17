@@ -1507,24 +1507,20 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             layout = (
                 row_outermost_layout(shape, self.model_dtype) if device.type == "spyre" else None
             )
-            self._staging = (
-                convert(
-                    torch.zeros(shape, dtype=self.model_dtype),
-                    device,
-                    device_layout=layout,
-                ),
-                convert(
-                    torch.zeros(shape, dtype=self.model_dtype),
-                    device,
-                    device_layout=layout,
-                ),
-            )
+
+            def zeros() -> torch.Tensor:
+                if device.type == "spyre":
+                    # zero_ uses device-side MEMORY_FILL, avoiding host allocation and H2D.
+                    return torch.empty(
+                        shape, dtype=self.model_dtype, device=device, device_layout=layout
+                    ).zero_()
+                return torch.zeros(shape, dtype=self.model_dtype, device=device)
+
+            self._staging = (zeros(), zeros())
             # Each grouped dispatch writes its batch here before the scatter into
             # out_staging; same shape and layout, so it matches the recorded variants.
             if envs.SPYRE_JAGGED_DECODE:
-                self._group_staging = convert(
-                    torch.zeros(shape, dtype=self.model_dtype), device, device_layout=layout
-                )
+                self._group_staging = zeros()
         return self._staging
 
     def staging_buffers(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
