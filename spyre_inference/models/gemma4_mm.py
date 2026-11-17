@@ -94,7 +94,8 @@ def _as_plain_linear(layer: nn.Module) -> nn.Linear:
     # `Tensor | Module` generically; this layer's is always a real Tensor.
     weight_t = convert(cast(torch.Tensor, layer.weight).detach(), device="cpu")
     in_features, out_features = weight_t.shape
-    plain = nn.Linear(in_features, out_features, bias=layer.bias is not None)
+    # Both parameters are replaced below; do not allocate or initialize throwaway weights.
+    plain = nn.Linear(in_features, out_features, bias=layer.bias is not None, device="meta")
     plain.weight = nn.Parameter(weight_t.t().contiguous(), requires_grad=False)
     if layer.bias is not None:
         bias = convert(cast(torch.Tensor, layer.bias).detach(), device="cpu")
@@ -134,7 +135,7 @@ def _two_axis_layout(x: torch.Tensor, padded_head_dim: int, fill: float = 0.0) -
 
 
 def _rebuilt_linear(weight: torch.Tensor, bias: torch.Tensor | None) -> nn.Linear:
-    linear = nn.Linear(weight.shape[1], weight.shape[0], bias=bias is not None)
+    linear = nn.Linear(weight.shape[1], weight.shape[0], bias=bias is not None, device="meta")
     linear.weight = nn.Parameter(weight, requires_grad=False)
     if bias is not None:
         linear.bias = nn.Parameter(bias, requires_grad=False)

@@ -868,6 +868,56 @@ def test_quantized_projection_is_rejected_rather_than_dequantized():
         _as_plain_linear(_FakeQuantLinear())
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_linear_rebuild_skips_throwaway_host_parameters(dtype, with_bias, monkeypatch):
+    from spyre_inference.models.gemma4_mm import _as_plain_linear, _rebuilt_linear
+
+    weight = torch.arange(32 * 8, dtype=dtype).reshape(32, 8) / 256
+    bias = torch.arange(32, dtype=dtype) / 32 if with_bias else None
+    src = nn.Module()
+    src.weight = nn.Parameter(weight.t().contiguous(), requires_grad=False)
+    src.bias = nn.Parameter(bias.clone(), requires_grad=False) if with_bias else None
+    inputs = torch.arange(16, dtype=dtype).reshape(2, 8) / 16
+    expected = torch.nn.functional.linear(inputs, weight, bias)
+    rng_state = torch.random.get_rng_state()
+    reset_devices = []
+    original_reset = nn.Linear.reset_parameters
+
+    def reset_on_meta(linear):
+        reset_devices.append(linear.weight.device.type)
+        assert all(p.is_meta for p in linear.parameters())
+        original_reset(linear)
+
+    monkeypatch.setattr(nn.Linear, "reset_parameters", reset_on_meta)
+    plain = _as_plain_linear(src)
+    rebuilt = _rebuilt_linear(weight, bias)
+
+    assert reset_devices == ["meta", "meta"]
+    assert torch.equal(torch.random.get_rng_state(), rng_state)
+    for linear in (plain, rebuilt):
+        assert (linear.in_features, linear.out_features) == (8, 32)
+        assert not any(p.is_meta or p.requires_grad for p in linear.parameters())
+        assert all(p.dtype == dtype and p.device.type == "cpu" for p in linear.parameters())
+        torch.testing.assert_close(linear.weight, weight, rtol=0, atol=0)
+        assert (linear.bias is not None) == with_bias
+        if with_bias:
+            torch.testing.assert_close(linear.bias, bias, rtol=0, atol=0)
+        torch.testing.assert_close(linear(inputs), expected, rtol=0, atol=0)
+    assert rebuilt.weight.data_ptr() == weight.data_ptr()
+    assert plain.weight.data_ptr() != src.weight.data_ptr()
+    if with_bias:
+        assert rebuilt.bias.data_ptr() == bias.data_ptr()
+        assert plain.bias.data_ptr() != src.bias.data_ptr()
+
+
+def test_plain_linear_is_not_rebuilt():
+    from spyre_inference.models.gemma4_mm import _as_plain_linear
+
+    linear = nn.Linear(8, 32)
+    assert _as_plain_linear(linear) is linear
+
+
 def test_unquantized_vllm_linear_is_bounced_to_a_plain_linear():
     """A vLLM linear stores `Wᵀ`, so the bounce must transpose back to `[out, in]`."""
     from vllm.model_executor.layers.linear import UnquantizedLinearMethod
