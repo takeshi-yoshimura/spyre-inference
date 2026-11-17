@@ -95,7 +95,9 @@ def register_ops():
     """Register the Spyre OOT custom ops and model adaptations."""
     from spyre_inference.custom_ops import register_all
     from spyre_inference.models import register_models
+    from spyre_inference.v1.worker.fastsafetensors_loader import install_fastsafetensors_iterator
 
+    install_fastsafetensors_iterator()
     with keep_sigterm_handler():
         register_all()
         register_models()
