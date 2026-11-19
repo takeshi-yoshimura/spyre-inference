@@ -32,9 +32,9 @@ tree's plain attributes (ints, strings, shapes, ...) must match too, so state a
 meta build derives differently is caught. A mismatch returns False, and the
 caller discards the partially restored model and loads normally.
 
-The shards are standard safetensors (spyre-inference's device-native
-convention); everything else is JSON in ``__metadata__``, and nothing in the
-files is executed on load.
+The shards use fastsafetensors' device-native convention in standard safetensors
+files. The model-specific replay recipe is JSON in ``__metadata__``; nothing
+in the files is executed on load.
 """
 
 from __future__ import annotations
@@ -49,23 +49,22 @@ from typing import Any
 import torch
 import torch.nn as nn
 from fastsafetensors import ParallelLoader, SafeTensorsMetadata
-from fastsafetensors.copier.spyre import MAX_TRANSFER_BYTES
+from fastsafetensors.copier.spyre import (
+    MAX_TRANSFER_BYTES,
+    native_entry,
+    native_fill,
+    native_shard_metadata,
+)
 from fastsafetensors.frameworks import get_framework_op
 from fastsafetensors.saver import (
     ParallelSaver,
     plain_entry,
     shard_paths,
-    tensor_fill,
     validate_shard_set,
 )
 from safetensors import safe_open
 from vllm.logger import init_logger
 
-from spyre_inference.v1.worker.spyre_native_format import (
-    NativePayload,
-    native_entry,
-    shard_metadata,
-)
 from spyre_inference.v1.worker.spyre_native_loader import _is_dense, _Recorder, fill_records
 
 logger = init_logger(__name__)
@@ -225,27 +224,6 @@ def _fp8_layers(model: nn.Module):
             yield path, layer, kernel
 
 
-def _native_fill(work) -> None:
-    if not work:
-        return
-    from torch_spyre._C import convert_h2d_into
-
-    convert_h2d_into(
-        [(buf, entry.source.src, entry.source.dst) for buf, entry in work],
-        num_threads=min(64, os.cpu_count() or 1),
-    )
-
-
-def _fill(work) -> None:
-    plain, native = [], []
-    for buf, entry in work:
-        (native if isinstance(entry.source, NativePayload) else plain).append((buf, entry))
-    if plain:
-        tensor_fill()(plain)
-    if native:
-        _native_fill(native)
-
-
 def write_cache(model: nn.Module, device: torch.device, base: str, key: dict) -> bool:
     """Write ``model``'s tensors, as ``model.to(device)`` leaves them, to ``base``'s shards.
 
@@ -299,8 +277,8 @@ def write_cache(model: nn.Module, device: torch.device, base: str, key: dict) ->
     try:
         saver = ParallelSaver(
             num_shards=_NUM_SHARDS,
-            shard_metadata=shard_metadata,
-            fill=_fill,
+            shard_metadata=native_shard_metadata,
+            fill=native_fill,
             min_free_bytes=1 << 30,
         )
         paths = saver.save_entries(

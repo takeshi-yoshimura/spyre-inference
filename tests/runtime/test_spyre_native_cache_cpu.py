@@ -10,6 +10,7 @@ from types import ModuleType
 
 import pytest
 import torch
+from fastsafetensors.copier.spyre import native_shard_metadata
 from fastsafetensors.saver import ParallelSaver, plain_entry, save_sharded
 from safetensors import safe_open
 from safetensors.torch import save_file
@@ -17,7 +18,12 @@ from safetensors.torch import save_file
 from spyre_inference.v1.worker import spyre_native_cache as cache
 
 
-def test_custom_fill_routes_encoded_and_plain_tensors(tmp_path, monkeypatch):
+def test_write_cache_uses_backend_native_writer(tmp_path, monkeypatch):
+    from fastsafetensors.copier import spyre
+    from fastsafetensors.native import NativeFormat, native_format, native_specs
+
+    from spyre_inference.v1.worker.spyre_native_loader import Record
+
     runtime = ModuleType("torch_spyre._C")
     calls = []
 
@@ -28,25 +34,54 @@ def test_custom_fill_routes_encoded_and_plain_tensors(tmp_path, monkeypatch):
             buf[:] = src.reshape(-1).view(torch.uint8).numpy().tobytes()
 
     runtime.convert_h2d_into = encode
+    runtime.dma_bytes = lambda dst: dst.nbytes
+    runtime.get_spyre_tensor_layout = lambda dst: {"test_layout": 1}
+    layouts = ModuleType("torch_spyre.layout")
+    layouts.layout_to_json = lambda layout: layout
     monkeypatch.setitem(sys.modules, "torch_spyre._C", runtime)
-    src = torch.arange(4, dtype=torch.float16)
-    plain = torch.arange(3, dtype=torch.int64)
-    saver = ParallelSaver(num_shards=2, fill=cache._fill, shard_metadata=cache.shard_metadata)
-    paths = saver.save_entries(
-        [
-            cache.native_entry("raw", src, torch.empty_like(src), nbytes=src.nbytes, layout={}),
-            plain_entry("plain", plain),
-        ],
-        str(tmp_path / "mixed"),
-    )
-    restored = {}
+    monkeypatch.setitem(sys.modules, "torch_spyre.layout", layouts)
+
+    class Recorder:
+        def __init__(self, device):
+            self.records = []
+
+        def __call__(self, src):
+            dst = torch.empty_like(src)
+            self.records.append(Record("defer", src, dst))
+            return dst
+
+    def saver(**kwargs):
+        assert kwargs["fill"] is spyre.native_fill
+        assert kwargs["shard_metadata"] is spyre.native_shard_metadata
+        return ParallelSaver(**kwargs)
+
+    monkeypatch.setattr(cache, "_Recorder", Recorder)
+    monkeypatch.setattr(cache, "ParallelSaver", saver)
+    model = torch.nn.Module()
+    expected = torch.arange(4, dtype=torch.float16)
+    model.register_buffer("weight", expected.clone())
+    base = str(tmp_path / "cache")
+    key = {"model": "cpu-test", "rank": 0}
+    assert cache.write_cache(model, torch.device("cpu"), base, key)
+    paths = cache.shard_paths(base, cache._NUM_SHARDS)
+    framework = cache.get_framework_op("pytorch")
+    specs = {}
     for path in paths:
+        meta = cache.SafeTensorsMetadata.from_file(path, framework)
+        assert native_format(meta) == NativeFormat("spyre", "torch_spyre/1")
+        specs.update(native_specs(meta))
         with safe_open(path, framework="pt") as checkpoint:
             names = checkpoint.keys()
-            restored.update({name: checkpoint.get_tensor(name) for name in names})
+            if "t0" in names:
+                assert torch.equal(checkpoint.get_tensor("t0"), expected.view(torch.uint8))
+    with safe_open(paths[0], framework="pt") as checkpoint:
+        metadata = checkpoint.metadata()
+    assert metadata[cache._KEY_FORMAT] == cache.FORMAT
+    assert json.loads(metadata[cache._KEY_KEY]) == key
+    records = json.loads(metadata[cache._KEY_RECORDS])
+    assert records[0]["kind"] == "raw" and records[0]["name"] == "t0"
+    assert specs["t0"].layout == records[0]["layout"] == {"test_layout": 1}
     assert calls
-    assert torch.equal(restored["raw"], src.view(torch.uint8))
-    assert torch.equal(restored["plain"], plain)
 
 
 @dataclass(frozen=True)
@@ -102,7 +137,7 @@ def checkpoint(tmp_path):
         entries,
         base,
         num_shards=cache._NUM_SHARDS,
-        shard_metadata=cache.shard_metadata,
+        shard_metadata=native_shard_metadata,
         metadata={cache._KEY_FORMAT: cache.FORMAT, cache._KEY_KEY: json.dumps(key, sort_keys=True)},
         shard0_metadata={
             cache._KEY_RECORDS: json.dumps(records),
