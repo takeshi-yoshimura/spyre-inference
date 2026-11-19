@@ -28,6 +28,7 @@ import gc
 import hashlib
 import json
 import os
+import time
 
 import regex as re
 import torch
@@ -43,6 +44,7 @@ from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 
 from spyre_inference import envs
 from spyre_inference.v1.worker.model_build import build_model
+from spyre_inference.v1.worker.model_load import move_model_to_spyre
 
 logger = init_logger(__name__)
 
@@ -84,12 +86,13 @@ class SpyreNativeModelLoader(BaseModelLoader):
         prefix: str = "",
         device: torch.device | None = None,
     ) -> nn.Module:
+        from fastsafetensors.copier.spyre import TransferRecorder
+
         from spyre_inference.v1.worker.spyre_native_cache import (
             cache_exists,
             restore_cache,
             write_cache,
         )
-        from spyre_inference.v1.worker.spyre_native_loader import move_model_to_spyre
 
         device = device or torch.device("spyre")
         load_config = self._host_config(model_config)
@@ -135,7 +138,16 @@ class SpyreNativeModelLoader(BaseModelLoader):
         del model
         forget_discarded_model()
         model = build_model(load_config, vllm_config, model_config)
-        move_model_to_spyre(model, device)
+        t0 = time.time()
+        recorder = TransferRecorder(device)
+        move_model_to_spyre(model, device, transfer=recorder)
+        pipeline = recorder.fill()
+        logger.info(
+            "spyre_native: moved model to %s in %.1fs (%s)",
+            device,
+            time.time() - t0,
+            pipeline.summary(),
+        )
         return model
 
 

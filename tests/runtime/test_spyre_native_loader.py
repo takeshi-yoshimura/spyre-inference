@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``move_model_to_spyre`` must be byte-identical to ``model.to(spyre)``."""
+"""Native model traversal and cache integration with the Spyre transfer backend."""
 
 import copy
 
@@ -20,23 +20,8 @@ import pytest
 import torch
 import torch.nn as nn
 from fastsafetensors.copier import spyre as _transfer_pipeline
+from fastsafetensors.copier.spyre import TransferRecorder
 from spyre_testing_plugin.pytest_plugin import spyre_available
-
-from spyre_inference.v1.worker.spyre_native_loader import _is_dense, move_model_to_spyre
-
-
-@pytest.mark.parametrize(
-    "t, dense",
-    [
-        (torch.empty(4, 8), True),
-        (torch.empty(8, 4).t(), True),
-        (torch.empty(4, 1, 8), True),
-        (torch.empty(4, 8)[:, :4], False),
-        (torch.empty(8).expand(4, 8), False),
-    ],
-)
-def test_is_dense(t, dense):
-    assert _is_dense(t) == dense
 
 
 class _Model(nn.Module):
@@ -86,7 +71,9 @@ def test_matches_model_to(monkeypatch, max_buffers, max_batch_bytes):
     model = _Model()
     expected = {k: v.cpu() for k, v in copy.deepcopy(model).to(device).state_dict().items()}
 
-    move_model_to_spyre(model, device)
+    recorder = TransferRecorder(device)
+    model._apply(recorder)
+    recorder.fill()
 
     for name, t in model.state_dict().items():
         assert t.device.type == "spyre", name
@@ -113,9 +100,12 @@ def _cache_model():
 
 
 def _all_tensors(model):
-    from spyre_inference.v1.worker.spyre_native_cache import _module_tensors
+    import json
 
-    return {path: t.detach().cpu() for path, _, _, _, t in _module_tensors(model)}
+    tensors = {
+        json.dumps([prefix, path]): t for prefix, path, t in _transfer_pipeline._tensor_paths(model)
+    }
+    return {path: t.detach().cpu() for path, t in tensors.items()}
 
 
 def test_cache_restores_model_to_exactly(tmp_path):
@@ -155,7 +145,8 @@ def test_cache_restores_model_to_exactly(tmp_path):
     with torch.device("meta"):
         changed = _cache_model()
     changed.host.width = 4
-    assert not restore_cache(changed, device, path, key)
+    assert restore_cache(changed, device, path, key)
+    assert changed.host.width == 4
 
 
 def test_spyre_native_is_a_registered_load_format():

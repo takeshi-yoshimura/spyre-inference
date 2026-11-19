@@ -312,6 +312,67 @@ def test_meta_build_does_not_read_source_weights(monkeypatch):
     assert config.load_config is original
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_symbolic_host_copies_are_scoped_to_skeleton(dtype):
+    from spyre_inference.v1.worker.model_build import _MetaHostCopies
+
+    source = torch.arange(4.0)
+    meta = torch.empty(4, device="meta")
+    original_to = torch.Tensor.to
+    with _MetaHostCopies():
+        assert meta.to("cpu", dtype).is_meta
+        assert meta.to(device="cpu", dtype=dtype).is_meta
+        assert meta.cpu().is_meta
+        torch.testing.assert_close(source.to("cpu", dtype), source.to(dtype))
+    assert torch.Tensor.to is original_to
+    with pytest.raises(NotImplementedError, match="meta"):
+        meta.to("cpu")
+
+
+def test_skeleton_constructs_transformers_rope_without_model_changes(monkeypatch):
+    from vllm.config import LoadConfig
+
+    from spyre_inference.transformers_backend import _SpyreRotaryEmbedding
+    from spyre_inference.v1.worker import model_build
+
+    def initialize(**kwargs):
+        original = torch.nn.Module()
+        original.register_buffer("inv_freq", torch.arange(4.0))
+        return _SpyreRotaryEmbedding(original, 8, 64, torch.float16)
+
+    monkeypatch.setattr(model_build, "initialize_model", initialize)
+    monkeypatch.setattr(model_build, "process_weights_after_loading", lambda *args: None)
+    loader = model_build.SkeletonLoader(LoadConfig(device="meta"))
+    model = loader.load_model(SimpleNamespace(), SimpleNamespace(dtype=torch.float16))
+    assert model._cpu_caches[None].is_meta
+    assert not hasattr(model, "spyre_native_host_tensors")
+
+
+def test_recorded_move_keeps_ordinary_sink_and_moe_finalization(monkeypatch):
+    from spyre_inference.v1.worker import model_load
+
+    model = torch.nn.Module()
+    model.weight = torch.nn.Parameter(torch.ones(2), requires_grad=False)
+    impl = SimpleNamespace(_sinks_source=model.weight)
+    model.spyre_moe_biases = True
+    model.quant_method = SimpleNamespace(moe_quant_config=object())
+    calls = []
+
+    def initialize():
+        assert model.quant_method.moe_quant_config is None
+        calls.append("moe")
+
+    def transfer(tensor):
+        calls.append("transfer")
+        return tensor + 1
+
+    monkeypatch.setattr(model_load, "_sink_owners", lambda model: [(impl, model, "weight")])
+    model._ensure_moe_quant_config_init = initialize
+    model_load.move_model_to_spyre(model, torch.device("cpu"), transfer=transfer)
+    assert impl._sinks_source is model.weight
+    assert calls == ["transfer", "moe"]
+
+
 def test_pt_fallback_still_uses_upstream_loader(tmp_path):
     from vllm.config import LoadConfig
     from vllm.model_executor.model_loader import get_model_loader
@@ -332,11 +393,11 @@ def test_pt_fallback_still_uses_upstream_loader(tmp_path):
 
 @pytest.mark.parametrize("mode", ["miss", "hit", "unusable", "unwritable"])
 def test_native_cache_control_flow(tmp_path, monkeypatch, mode):
+    from fastsafetensors.copier import spyre as transfer
     from safetensors.torch import save_file
     from vllm.config import LoadConfig
 
     from spyre_inference.v1.worker import spyre_native_cache as cache
-    from spyre_inference.v1.worker import spyre_native_loader as transfer
     from spyre_inference.v1.worker import spyre_native_model_loader as native
 
     save_file({"w": torch.ones(2)}, str(tmp_path / "model.safetensors"))
@@ -356,6 +417,7 @@ def test_native_cache_control_flow(tmp_path, monkeypatch, mode):
         calls.append(("build", load_config.device))
         assert load_config.load_format == "fastsafetensors"
         model = torch.nn.Module()
+        model.register_buffer("weight", torch.ones(2, dtype=torch.float16))
         builds.append(model)
         return model
 
@@ -369,20 +431,29 @@ def test_native_cache_control_flow(tmp_path, monkeypatch, mode):
         calls.append(("restore",))
         return mode != "unusable"
 
-    def move(model, *args):
-        assert model is builds[-1]
-        calls.append(("move",))
+    class Recorder:
+        def __init__(self, device):
+            assert device == torch.device("cpu")
+
+        def __call__(self, tensor):
+            assert tensor is builds[-1].weight
+            calls.append(("transfer",))
+            return tensor
+
+        def fill(self):
+            calls.append(("fill",))
+            return SimpleNamespace(summary=lambda: "backend transfer")
 
     monkeypatch.setattr(native, "build_model", build)
     monkeypatch.setattr(cache, "write_cache", write)
     monkeypatch.setattr(cache, "restore_cache", restore)
-    monkeypatch.setattr(transfer, "move_model_to_spyre", move)
+    monkeypatch.setattr(transfer, "TransferRecorder", Recorder)
     model = loader.load_model(config, model_config, device=torch.device("cpu"))
     assert model is builds[-1]
     expected = {
         "miss": [("build", "cpu"), ("write",), ("build", "meta"), ("restore",)],
         "hit": [("build", "meta"), ("restore",)],
-        "unusable": [("build", "meta"), ("restore",), ("build", "cpu"), ("move",)],
+        "unusable": [("build", "meta"), ("restore",), ("build", "cpu"), ("transfer",), ("fill",)],
         "unwritable": [("build", "cpu"), ("write",)],
     }[mode]
     assert calls == expected

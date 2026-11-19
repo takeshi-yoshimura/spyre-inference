@@ -24,6 +24,7 @@ from unittest.mock import patch
 
 import torch
 import torch.nn as nn
+from torch.utils._python_dispatch import TorchDispatchMode
 from vllm import envs as vllm_envs
 from vllm.config import LoadConfig, ModelConfig, VllmConfig
 from vllm.model_executor.layers.attention.attention import Attention
@@ -76,6 +77,28 @@ class _HostModelLoader(DefaultModelLoader):
         return ((source.prefix + name, tensor) for name, tensor in weights)
 
 
+class _MetaHostCopies(TorchDispatchMode):
+    """Keep meta-to-CPU copies symbolic until the native cache supplies their values."""
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        if (
+            func in (torch.ops.aten.to.device, torch.ops.aten.to.prim_Device)
+            and args[0].is_meta
+            and args[1] is not None
+            and torch.device(args[1]).type == "cpu"
+        ):
+            args = (args[0], torch.device("meta"), *args[2:])
+        if (
+            func in (torch.ops.aten._to_copy.default, torch.ops.aten.to.dtype_layout)
+            and args[0].is_meta
+            and kwargs.get("device") is not None
+            and torch.device(kwargs["device"]).type == "cpu"
+        ):
+            kwargs = {**kwargs, "device": torch.device("meta")}
+        return func(*args, **kwargs)
+
+
 class SkeletonLoader(DefaultModelLoader):
     """Builds and post-processes the model on meta without reading any weights."""
 
@@ -93,7 +116,7 @@ class SkeletonLoader(DefaultModelLoader):
             with torch.device("cpu"):
                 attention_init(layer, *args, **kwargs)
 
-        with set_default_torch_dtype(cast(torch.dtype, model_config.dtype)):
+        with set_default_torch_dtype(cast(torch.dtype, model_config.dtype)), _MetaHostCopies():
             with torch.device("meta"), patch.object(Attention, "__init__", host_attention_init):
                 model = initialize_model(
                     vllm_config=vllm_config, model_config=model_config, prefix=prefix
