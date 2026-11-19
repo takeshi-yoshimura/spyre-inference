@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Generator
 from functools import wraps
 from typing import cast
@@ -24,14 +25,55 @@ from unittest.mock import patch
 import torch
 import torch.nn as nn
 from vllm import envs as vllm_envs
-from vllm.config import LoadConfig, ModelConfig, VllmConfig, get_current_vllm_config
+from vllm.config import LoadConfig, ModelConfig, VllmConfig
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.utils import initialize_model, process_weights_after_loading
+from vllm.model_executor.model_loader.weight_utils import (
+    filter_mm_encoder_only_safetensors_files,
+    filter_safetensors_files_by_weight_name,
+)
 from vllm.utils.torch_utils import set_default_torch_dtype
 
-from spyre_inference.v1.worker.model_load import install_pad_loaders, fix_padded_model
+from spyre_inference.v1.worker.model_load import fix_padded_model, install_pad_loaders
+
+
+class _HostModelLoader(DefaultModelLoader):
+    """CPU fastsafetensors loading used only while building a native cache."""
+
+    def _get_weights_iterator(
+        self, source: DefaultModelLoader.Source
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        hf_folder, files, use_safetensors, index_file = self._prepare_weights(
+            source.model_or_path,
+            source.subfolder,
+            source.revision,
+            source.fall_back_to_pt,
+            source.allow_patterns_overrides,
+        )
+        if not use_safetensors:
+            return super()._get_weights_iterator(source)
+        if self._encoder_only_lm_prefixes is not None and files:
+            files = filter_mm_encoder_only_safetensors_files(
+                files,
+                hf_folder,
+                index_file,
+                self._encoder_only_lm_prefixes,
+                weights_mapper=self._encoder_only_weights_mapper,
+            )
+            if not files:
+                raise RuntimeError(
+                    "mm-encoder-only shard filter removed all weight files for "
+                    f"`{source.model_or_path}`; check language_model prefixes "
+                    f"{self._encoder_only_lm_prefixes}"
+                )
+        if source.is_unused_weight is not None:
+            files = filter_safetensors_files_by_weight_name(files, source.is_unused_weight)
+        weights = _host_fastsafetensors_weights_iterator(files, self.load_config.use_tqdm_on_load)
+        if self.counter_before_loading_weights == 0.0:
+            self.counter_before_loading_weights = time.perf_counter()
+        return ((source.prefix + name, tensor) for name, tensor in weights)
 
 
 class SkeletonLoader(DefaultModelLoader):
@@ -70,11 +112,12 @@ def build_model(
     With ``load_config.device == "meta"`` the model is only built (see
     ``SkeletonLoader``), for ``spyre_native_cache.restore_cache`` to fill.
     """
-    model_loader = (
-        SkeletonLoader(load_config)
-        if load_config.device == "meta"
-        else get_model_loader(load_config)
-    )
+    if load_config.device == "meta":
+        model_loader = SkeletonLoader(load_config)
+    elif load_config.load_format == "fastsafetensors":
+        model_loader = _HostModelLoader(load_config)
+    else:
+        model_loader = get_model_loader(load_config)
 
     install_pad_loaders(model_loader, model_config)
 
@@ -96,29 +139,25 @@ def build_model(
     return model
 
 
-def fastsafetensors_weights_iterator(
+def _host_fastsafetensors_weights_iterator(
     hf_weights_files: list[str], use_tqdm_on_load: bool
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
-    """vLLM's ``--load-format fastsafetensors`` iterator, loading onto the device the
-    model is being built on (the host, for Spyre) instead of assuming CUDA.
+    """Read a native cache's source checkpoint onto the host, without GDS.
 
-    The target is host memory, so GDS never applies (nogds). Every rank needs the
-    full tensors before TP slicing, and reading them locally beats broadcasting
+    Every rank needs the full tensors before TP slicing, and reading them locally beats broadcasting
     them over the CPU (gloo) group, so each rank reads every file (all_local).
     """
     from fastsafetensors import SingleGroup
     from fastsafetensors.parallel_loader import ParallelLoader
     from vllm.model_executor.model_loader.weight_utils import _natural_sort_key, enable_tqdm
 
-    vllm_config = get_current_vllm_config()
-    device = vllm_config.load_config.device or vllm_config.device_config.device
     pg = torch.distributed.group.WORLD if torch.distributed.is_initialized() else SingleGroup()
     loader = ParallelLoader(
         pg=pg,
         hf_weights_files=sorted(hf_weights_files, key=_natural_sort_key),
         queue_size=vllm_envs.VLLM_FASTSAFETENSORS_QUEUE_SIZE,
         use_tqdm_on_load=enable_tqdm(use_tqdm_on_load),
-        device=str(device),
+        device="cpu",
         nogds=True,
         all_local=True,
     )
@@ -126,11 +165,3 @@ def fastsafetensors_weights_iterator(
         yield from loader.iterate_weights()
     finally:
         loader.close()
-
-
-def install_fastsafetensors_iterator() -> None:
-    """Route ``--load-format fastsafetensors`` through ``fastsafetensors_weights_iterator``."""
-    from vllm.model_executor.model_loader import default_loader, weight_utils
-
-    default_loader.fastsafetensors_weights_iterator = fastsafetensors_weights_iterator
-    weight_utils.fastsafetensors_weights_iterator = fastsafetensors_weights_iterator

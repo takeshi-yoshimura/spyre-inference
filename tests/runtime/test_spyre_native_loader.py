@@ -186,7 +186,11 @@ def test_cache_miss_loads_safetensors_with_fastsafetensors(tmp_path):
     torch.save({"w": torch.zeros(2)}, str(bin_dir / "pytorch_model.bin"))
 
     def fmt(path):
-        return loader._host_config(SimpleNamespace(model=str(path), revision=None)).load_format
+        config = loader._host_config(SimpleNamespace(model=str(path), revision=None))
+        assert config.device == "cpu"
+        assert loader.load_config.load_format == "spyre_native"
+        assert loader.load_config.device is None
+        return config.load_format
 
     assert fmt(st_dir) == "fastsafetensors"
     assert fmt(bin_dir) == "auto"

@@ -28,8 +28,8 @@ import gc
 import hashlib
 import json
 import os
-import regex as re
 
+import regex as re
 import torch
 import torch.nn as nn
 from vllm import envs as vllm_envs
@@ -42,7 +42,7 @@ from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 
 from spyre_inference import envs
-from spyre_inference.v1.worker.model_build import build_model, install_fastsafetensors_iterator
+from spyre_inference.v1.worker.model_build import build_model
 
 logger = init_logger(__name__)
 
@@ -58,8 +58,8 @@ class SpyreNativeModelLoader(BaseModelLoader):
         mmap of "auto" leaves pages to fault in during post-processing, which is
         much slower from disk. Checkpoints without safetensors files use "auto".
         """
-        install_fastsafetensors_iterator()
         load_config = copy.copy(self.load_config)
+        load_config.device = "cpu"
         load_config.load_format = "fastsafetensors"
         try:
             DefaultModelLoader(load_config)._prepare_weights(

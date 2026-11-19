@@ -89,11 +89,8 @@ def register_ops():
     """Register the Spyre OOT custom ops and model adaptations."""
     from spyre_inference.custom_ops import register_all
     from spyre_inference.models import register_models
-
-    from spyre_inference.v1.worker.model_build import install_fastsafetensors_iterator
     from spyre_inference.v1.worker import spyre_native_model_loader  # noqa: F401
 
-    install_fastsafetensors_iterator()
     with keep_sigterm_handler():
         register_all()
         register_models()
